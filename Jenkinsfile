@@ -14,7 +14,7 @@ pipeline {
     REMOTE_USER = 'sapiece'
     REMOTE_CREDENTIALS = 'ubuntu-server'
 
-    REMOTE_PROJECT_DIR = '/opt/software/spiece-server/hello'
+    REMOTE_PROJECT_DIR = '/opt/software/sapiece-server/hello'
     REMOTE_ARTIFACT = '/tmp/hello-native.tgz'
 
     APP_NAME = ''
