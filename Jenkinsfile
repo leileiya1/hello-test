@@ -18,7 +18,8 @@ pipeline {
     REMOTE_ARTIFACT = '/tmp/hello-native.tgz'
 
     APP_NAME = ''
-    APP_PORT = '8080'
+    APP_PORT = '4387'
+    HOST_PORT = ''
     APP_VERSION_PREFIX = '0.0'
   }
 
@@ -189,8 +190,13 @@ pipeline {
               APP_PORT_LOCAL="8080"
             fi
 
+            HOST_PORT_LOCAL="${HOST_PORT:-}"
+            if [ -z "$HOST_PORT_LOCAL" ]; then
+              HOST_PORT_LOCAL="$APP_PORT_LOCAL"
+            fi
+
             ssh -o StrictHostKeyChecking=no "$REMOTE_USER@$REMOTE_HOST" \
-              "REMOTE_PROJECT_DIR='$REMOTE_PROJECT_DIR' APP_NAME='$APP_NAME_LOCAL' APP_PORT='$APP_PORT_LOCAL' APP_VERSION_PREFIX='$APP_VERSION_PREFIX' BUILD_NUMBER='$BUILD_NUMBER' bash -s" <<'EOF'
+              "REMOTE_PROJECT_DIR='$REMOTE_PROJECT_DIR' APP_NAME='$APP_NAME_LOCAL' APP_PORT='$APP_PORT_LOCAL' HOST_PORT='$HOST_PORT_LOCAL' APP_VERSION_PREFIX='$APP_VERSION_PREFIX' BUILD_NUMBER='$BUILD_NUMBER' bash -s" <<'EOF'
 set -euo pipefail
 cd "$REMOTE_PROJECT_DIR"
 
@@ -211,14 +217,45 @@ docker_cmd() {
   fi
 }
 
+find_port_owner() {
+  local port="$1"
+  docker_cmd ps --format '{{.Names}} {{.Ports}}' | grep -E "(^|, )0\\.0\\.0\\.0:${port}->|\\[::\\]:${port}->" | awk '{print $1}' | head -n 1 || true
+}
+
 IMAGE_VERSION="${APP_VERSION_PREFIX}.${BUILD_NUMBER}"
 IMAGE_TAG="${APP_NAME}:${IMAGE_VERSION}"
 LATEST_TAG="${APP_NAME}:latest"
 CONTAINER_NAME="${APP_NAME}"
+RUN_HOST_PORT="${HOST_PORT}"
+
+if [ -z "$RUN_HOST_PORT" ]; then
+  RUN_HOST_PORT="$APP_PORT"
+fi
+
+PORT_CONFLICT=$(find_port_owner "$RUN_HOST_PORT")
+if [ -n "$PORT_CONFLICT" ] && [ "$PORT_CONFLICT" != "$CONTAINER_NAME" ]; then
+  echo "Port ${RUN_HOST_PORT} is in use by ${PORT_CONFLICT}, trying to find a free host port..."
+  FOUND_PORT=""
+  START_PORT=$((RUN_HOST_PORT + 1))
+  END_PORT=$((RUN_HOST_PORT + 200))
+  for p in $(seq "$START_PORT" "$END_PORT"); do
+    if [ -z "$(find_port_owner "$p")" ]; then
+      FOUND_PORT="$p"
+      break
+    fi
+  done
+  if [ -z "$FOUND_PORT" ]; then
+    echo "No free host port found in range ${START_PORT}-${END_PORT}."
+    docker_cmd ps --format 'Container={{.Names}} Ports={{.Ports}}'
+    exit 1
+  fi
+  RUN_HOST_PORT="$FOUND_PORT"
+fi
 
 echo "=== Naming ==="
 echo "APP_NAME=${APP_NAME}"
 echo "APP_PORT=${APP_PORT}"
+echo "HOST_PORT=${RUN_HOST_PORT}"
 echo "IMAGE_VERSION=${IMAGE_VERSION}"
 echo "IMAGE_TAG=${IMAGE_TAG}"
 echo "CONTAINER_NAME=${CONTAINER_NAME}"
@@ -237,13 +274,6 @@ docker_cmd images "$IMAGE_TAG" --format "Image: {{.Repository}}:{{.Tag}} Size: {
 echo "=== Image Layer History ==="
 docker_cmd history "$IMAGE_TAG" --no-trunc
 
-PORT_CONFLICT=$(docker_cmd ps --format '{{.Names}} {{.Ports}}' | grep -E "(^|, )0\\.0\\.0\\.0:${APP_PORT}->|\\[::\\]:${APP_PORT}->" | awk '{print $1}' | head -n 1 || true)
-if [ -n "$PORT_CONFLICT" ] && [ "$PORT_CONFLICT" != "$CONTAINER_NAME" ]; then
-  echo "Port ${APP_PORT} is already in use by container: ${PORT_CONFLICT}"
-  docker_cmd ps --format 'Container={{.Names}} Ports={{.Ports}}'
-  exit 1
-fi
-
 echo "=== Cleanup Old Container ==="
 if docker_cmd ps -a --format '{{.Names}}' | grep -Fx "$CONTAINER_NAME" >/dev/null 2>&1; then
   if docker_cmd ps --format '{{.Names}}' | grep -Fx "$CONTAINER_NAME" >/dev/null 2>&1; then
@@ -258,7 +288,7 @@ else
   echo "No old container to clean."
 fi
 
-docker_cmd run -d --name "$CONTAINER_NAME" -p "${APP_PORT}:${APP_PORT}" "$IMAGE_TAG"
+docker_cmd run -d --name "$CONTAINER_NAME" -p "${RUN_HOST_PORT}:${APP_PORT}" "$IMAGE_TAG"
 
 echo "=== Cleanup Old Images ==="
 CURRENT_IMAGE_ID=$(docker_cmd image inspect "$IMAGE_TAG" --format '{{.Id}}')
