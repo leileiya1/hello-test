@@ -18,6 +18,7 @@ pipeline {
     REMOTE_ARTIFACT = '/tmp/hello-native.tgz'
 
     APP_NAME = ''
+    APP_PORT = '8080'
     APP_VERSION_PREFIX = '0.0'
   }
 
@@ -36,7 +37,7 @@ pipeline {
       }
     }
 
-    stage('Resolve App Name') {
+    stage('Resolve App Config') {
       steps {
         dir('repo') {
           script {
@@ -60,13 +61,36 @@ pipeline {
               returnStdout: true
             ).trim()
 
+            def appPort = sh(
+              script: '''
+                set -euo pipefail
+                APP_FILE="src/main/resources/application.properties"
+                val=$(grep -E '^server\\.port=' "$APP_FILE" | tail -n 1 | cut -d'=' -f2- | tr -d '\\r' | xargs || true)
+                if [ -z "$val" ]; then
+                  val=8080
+                fi
+                echo "$val"
+              ''',
+              returnStdout: true
+            ).trim()
+
             if (!(appName ==~ /^[a-z0-9][a-z0-9._-]*$/)) {
               error("spring.application.name='${appName}' is not valid for Docker image name. Use lowercase letters, numbers, '.', '_' or '-'.")
             }
 
+            if (!(appPort ==~ /^[0-9]{1,5}$/)) {
+              error("server.port='${appPort}' is invalid.")
+            }
+            int p = appPort.toInteger()
+            if (p < 1 || p > 65535) {
+              error("server.port='${appPort}' is out of range (1-65535).")
+            }
+
             env.APP_NAME = appName
-            echo "Resolved APP_NAME=${env.APP_NAME}"
+            env.APP_PORT = appPort
+            echo "Resolved APP_NAME=${env.APP_NAME}, APP_PORT=${env.APP_PORT}"
             writeFile file: "${env.WORKSPACE}/app-name.txt", text: "${appName}\n"
+            writeFile file: "${env.WORKSPACE}/app-port.txt", text: "${appPort}\n"
           }
         }
       }
@@ -147,17 +171,26 @@ pipeline {
         sshagent(credentials: [env.REMOTE_CREDENTIALS]) {
           sh '''
             set -euo pipefail
+
             APP_NAME_LOCAL="${APP_NAME:-}"
             if [ -z "$APP_NAME_LOCAL" ] && [ -f app-name.txt ]; then
               APP_NAME_LOCAL="$(tr -d '\\r\\n' < app-name.txt)"
             fi
             if [ -z "$APP_NAME_LOCAL" ]; then
-              echo "APP_NAME is empty. Resolve App Name stage did not produce a value."
+              echo "APP_NAME is empty. Resolve App Config stage did not produce a value."
               exit 1
             fi
 
+            APP_PORT_LOCAL="${APP_PORT:-}"
+            if [ -z "$APP_PORT_LOCAL" ] && [ -f app-port.txt ]; then
+              APP_PORT_LOCAL="$(tr -d '\\r\\n' < app-port.txt)"
+            fi
+            if [ -z "$APP_PORT_LOCAL" ]; then
+              APP_PORT_LOCAL="8080"
+            fi
+
             ssh -o StrictHostKeyChecking=no "$REMOTE_USER@$REMOTE_HOST" \
-              "REMOTE_PROJECT_DIR='$REMOTE_PROJECT_DIR' APP_NAME='$APP_NAME_LOCAL' APP_VERSION_PREFIX='$APP_VERSION_PREFIX' BUILD_NUMBER='$BUILD_NUMBER' bash -s" <<'EOF'
+              "REMOTE_PROJECT_DIR='$REMOTE_PROJECT_DIR' APP_NAME='$APP_NAME_LOCAL' APP_PORT='$APP_PORT_LOCAL' APP_VERSION_PREFIX='$APP_VERSION_PREFIX' BUILD_NUMBER='$BUILD_NUMBER' bash -s" <<'EOF'
 set -euo pipefail
 cd "$REMOTE_PROJECT_DIR"
 
@@ -185,6 +218,7 @@ CONTAINER_NAME="${APP_NAME}"
 
 echo "=== Naming ==="
 echo "APP_NAME=${APP_NAME}"
+echo "APP_PORT=${APP_PORT}"
 echo "IMAGE_VERSION=${IMAGE_VERSION}"
 echo "IMAGE_TAG=${IMAGE_TAG}"
 echo "CONTAINER_NAME=${CONTAINER_NAME}"
@@ -203,8 +237,42 @@ docker_cmd images "$IMAGE_TAG" --format "Image: {{.Repository}}:{{.Tag}} Size: {
 echo "=== Image Layer History ==="
 docker_cmd history "$IMAGE_TAG" --no-trunc
 
-docker_cmd rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
-docker_cmd run -d --name "$CONTAINER_NAME" -p 8080:8080 "$IMAGE_TAG"
+PORT_CONFLICT=$(docker_cmd ps --format '{{.Names}} {{.Ports}}' | grep -E "(^|, )0\\.0\\.0\\.0:${APP_PORT}->|\\[::\\]:${APP_PORT}->" | awk '{print $1}' | head -n 1 || true)
+if [ -n "$PORT_CONFLICT" ] && [ "$PORT_CONFLICT" != "$CONTAINER_NAME" ]; then
+  echo "Port ${APP_PORT} is already in use by container: ${PORT_CONFLICT}"
+  docker_cmd ps --format 'Container={{.Names}} Ports={{.Ports}}'
+  exit 1
+fi
+
+echo "=== Cleanup Old Container ==="
+if docker_cmd ps -a --format '{{.Names}}' | grep -Fx "$CONTAINER_NAME" >/dev/null 2>&1; then
+  if docker_cmd ps --format '{{.Names}}' | grep -Fx "$CONTAINER_NAME" >/dev/null 2>&1; then
+    echo "Stopping old container: $CONTAINER_NAME"
+    docker_cmd stop "$CONTAINER_NAME" >/dev/null
+  else
+    echo "Old container exists but is not running: $CONTAINER_NAME"
+  fi
+  echo "Removing old container: $CONTAINER_NAME"
+  docker_cmd rm "$CONTAINER_NAME" >/dev/null
+else
+  echo "No old container to clean."
+fi
+
+docker_cmd run -d --name "$CONTAINER_NAME" -p "${APP_PORT}:${APP_PORT}" "$IMAGE_TAG"
+
+echo "=== Cleanup Old Images ==="
+CURRENT_IMAGE_ID=$(docker_cmd image inspect "$IMAGE_TAG" --format '{{.Id}}')
+OLD_IMAGE_IDS=$(docker_cmd images "$APP_NAME" --format '{{.ID}}' | awk -v keep="$CURRENT_IMAGE_ID" '{id=$1; if (id !~ /^sha256:/) id="sha256:" id; if (id != keep) print id; }' | sort -u)
+if [ -n "$OLD_IMAGE_IDS" ]; then
+  echo "$OLD_IMAGE_IDS" | while read -r old_id; do
+    [ -n "$old_id" ] || continue
+    echo "Removing old image: $old_id"
+    docker_cmd rmi -f "$old_id" >/dev/null || true
+  done
+else
+  echo "No old images to clean."
+fi
+docker_cmd images "$APP_NAME" --format 'Remaining image: {{.Repository}}:{{.Tag}} {{.Size}}'
 
 echo "=== Container Runtime Info ==="
 docker_cmd ps --filter "name=$CONTAINER_NAME" --format "Container: {{.Names}} Status: {{.Status}} Ports: {{.Ports}}"
