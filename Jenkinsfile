@@ -14,7 +14,7 @@ pipeline {
     REMOTE_USER = 'sapiece'
     REMOTE_CREDENTIALS = 'ubuntu-server'
 
-    REMOTE_PROJECT_DIR = '/opt/software/sapiece-server/hello'
+    REMOTE_PROJECT_DIR = '/opt/software/spiece-server/hello'
     REMOTE_ARTIFACT = '/tmp/hello-native.tgz'
 
     APP_NAME = ''
@@ -66,6 +66,7 @@ pipeline {
 
             env.APP_NAME = appName
             echo "Resolved APP_NAME=${env.APP_NAME}"
+            writeFile file: "${env.WORKSPACE}/app-name.txt", text: "${appName}\n"
           }
         }
       }
@@ -146,8 +147,17 @@ pipeline {
         sshagent(credentials: [env.REMOTE_CREDENTIALS]) {
           sh '''
             set -euo pipefail
+            APP_NAME_LOCAL="${APP_NAME:-}"
+            if [ -z "$APP_NAME_LOCAL" ] && [ -f app-name.txt ]; then
+              APP_NAME_LOCAL="$(tr -d '\\r\\n' < app-name.txt)"
+            fi
+            if [ -z "$APP_NAME_LOCAL" ]; then
+              echo "APP_NAME is empty. Resolve App Name stage did not produce a value."
+              exit 1
+            fi
+
             ssh -o StrictHostKeyChecking=no "$REMOTE_USER@$REMOTE_HOST" \
-              "REMOTE_PROJECT_DIR='$REMOTE_PROJECT_DIR' APP_NAME='$APP_NAME' APP_VERSION_PREFIX='$APP_VERSION_PREFIX' BUILD_NUMBER='$BUILD_NUMBER' bash -s" <<'EOF'
+              "REMOTE_PROJECT_DIR='$REMOTE_PROJECT_DIR' APP_NAME='$APP_NAME_LOCAL' APP_VERSION_PREFIX='$APP_VERSION_PREFIX' BUILD_NUMBER='$BUILD_NUMBER' bash -s" <<'EOF'
 set -euo pipefail
 cd "$REMOTE_PROJECT_DIR"
 
